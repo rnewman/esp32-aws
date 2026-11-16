@@ -1,0 +1,243 @@
+# Makita AWS (WUT01) receiver on a Shelly Plug US Gen4 (ESP32-C6, 8 MB). See aws-common.yaml.
+#
+# For a Festool CT15: plug this into the CT's tool socket with the CT in auto mode,
+# and plug a 100-150 W incandescent/halogen bulb into this. Trigger pull -> relay
+# on -> bulb draws enough current -> CT starts.
+#
+# Hardware details from automatous-io/shelly-gen4-esphome (v1.5.2):
+#   relay GPIO4, button GPIO7 (active low), 12-LED WS2812 ring GPIO6,
+#   BL0942 power meter on UART1 (TX GPIO18, RX GPIO19).
+#
+# Flashing: this does NOT boot as a plain ESPHome image. Convert the plug with that
+# project's release zip via the stock web UI first (check `slot` is 1; see its
+# docs/INSTALL.md), then OTA this config. The partition component and table offset
+# below keep this build on Shelly's stock flash layout, so OTA keeps working.
+#
+# LED ring:  off = no tool seen
+#            red = WUT01 seen (tool powered, idle)
+#            green = trigger pulled
+#            blue pulse = pairing mode    orange pulse = unpair mode
+#            white blink = a tool was just paired/unpaired
+#            while holding the button: blue (2 s), orange (5 s), bright red (10 s)
+#
+# Caveat (from the upstream project): continuous BLE scanning starves the fallback
+# hotspot, so joining it may fail as if the password were wrong. Scanning stays on
+# regardless here so the extractor works without WiFi.
+
+substitutions:
+  name: shelly-plug-makita-aws
+  friendly_name: Makita AWS Shelly
+  short_friendly_name: AWS Shelly
+  # Safety trip, amps. The plug is rated 15 A; a bulb load is ~1 A.
+  current_limit: "12"
+
+packages:
+  aws: !include aws-common.yaml
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # Stock firmware leaves pad hold on the relay pin; without this the relay is
+    # frozen until a power cycle.
+    - priority: 1000
+      then:
+        - lambda: gpio_hold_dis(GPIO_NUM_4);
+
+esp32:
+  board: esp32-c6-devkitm-1
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # Shelly keeps the partition table at 0x10000, not IDF's 0x8000.
+      CONFIG_PARTITION_TABLE_OFFSET: "0x10000"
+
+# Ships Shelly's stock partition table into the build. Load-bearing; see upstream docs/PARTITIONS.md.
+external_components:
+  - source: github://automatous-io/shelly-gen4-esphome@v1.5.2
+    components: [shelly_gen4_partition]
+
+shelly_gen4_partition:
+
+logger:
+  level: DEBUG
+  hardware_uart: UART0
+  logs:
+    esp32_ble_tracker: INFO
+    light: INFO
+    binary_sensor: INFO
+    sensor: INFO
+    text_sensor: INFO
+    bl0942: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${short_friendly_name} fallback hotspot"
+    password: !secret wifi_ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+  version: 2
+
+binary_sensor:
+  - platform: status
+    name: Online
+
+  - platform: gpio
+    id: user_button
+    name: Button
+    entity_category: diagnostic
+    pin:
+      number: GPIO7
+      inverted: true
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on_off: 20ms
+    on_press:
+      - script.execute: aws_button_pressed
+    on_release:
+      - script.execute: aws_button_released
+
+switch:
+  - platform: gpio
+    id: extractor_relay
+    name: Extractor relay
+    pin: GPIO4
+    restore_mode: ALWAYS_OFF
+    icon: mdi:power-socket-us
+
+# The meter's TX needs the pull-up; without it RX idles low and nothing is received.
+uart:
+  id: uart_bl0942
+  tx_pin: GPIO18
+  rx_pin:
+    number: GPIO19
+    mode:
+      input: true
+      pullup: true
+  baud_rate: 9600
+  stop_bits: 1
+
+sensor:
+  # Watch these while switching the bulb by hand to find the CT15's real threshold.
+  - platform: bl0942
+    uart_id: uart_bl0942
+    line_frequency: 60Hz
+    update_interval: 2s
+    # Scaling measured on this board by the upstream project.
+    voltage_reference: 25169.82830
+    current_reference: 248840.32040
+    current:
+      name: Current
+      on_value_range:
+        - above: ${current_limit}
+          then:
+            - switch.turn_off: extractor_relay
+    voltage:
+      name: Voltage
+      entity_category: diagnostic
+    power:
+      name: Power
+    energy:
+      name: Energy
+      accuracy_decimals: 3
+
+  - platform: uptime
+    name: Uptime
+    update_interval: 600s
+  - platform: internal_temperature
+    name: ESP temperature
+    update_interval: 60s
+    # No NTC on this board; the chip temperature is the only overheat signal.
+    on_value_range:
+      - above: 95
+        then:
+          - switch.turn_off: extractor_relay
+
+button:
+  - platform: restart
+    name: ESP reboot
+    icon: mdi:power-cycle
+  - platform: safe_mode
+    name: Safe mode boot
+    entity_category: config
+
+text_sensor:
+  - platform: version
+    name: Version
+    hide_timestamp: true
+    entity_category: diagnostic
+  - platform: wifi_info
+    ip_address:
+      name: IP address
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_ring
+    name: LED ring
+    pin: GPIO6
+    num_leds: 12
+    chipset: WS2812
+    channel_colors: GRB
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+    effects:
+      - pulse:
+          name: Pulse
+          transition_length: 400ms
+          update_interval: 400ms
+      - strobe:
+          name: Blink
+          colors:
+            - state: true
+              brightness: 100%
+              red: 100%
+              green: 100%
+              blue: 100%
+              duration: 150ms
+            - state: false
+              duration: 150ms
+
+# Render led_mode. Only touch the light when the mode changes, so effects can run.
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          using namespace makita_aws;
+          static int shown = -1;
+          const int want = id(led_mode);
+          if (want == shown) return;
+          shown = want;
+
+          auto *led = id(led_ring);
+          if (want == LED_OFF) {
+            led->turn_off().perform();
+            return;
+          }
+          auto call = led->turn_on();
+          call.set_brightness(0.5f);
+          call.set_effect("None");
+          switch (want) {
+            case LED_PRESENT: call.set_rgb(1, 0, 0); break;
+            case LED_TRIGGER: call.set_rgb(0, 1, 0); break;
+            case LED_PAIR:    call.set_rgb(0, 0, 1); call.set_effect("Pulse"); break;
+            case LED_UNPAIR:  call.set_rgb(1, 0.35, 0); call.set_effect("Pulse"); break;
+            case LED_BLINK:   call.set_rgb(1, 1, 1); call.set_effect("Blink"); break;
+            case LED_HOLD2:   call.set_rgb(0, 0, 1); break;
+            case LED_HOLD5:   call.set_rgb(1, 0.35, 0); break;
+            case LED_HOLD10:  call.set_rgb(1, 0, 0); call.set_brightness(1.0f); break;
+          }
+          call.perform();

@@ -1,0 +1,230 @@
+# Makita AWS (WUT01) receiver on an Athom Plug V3 (ESP32-C3, US). See aws-common.yaml.
+#
+# For a Festool CT15: plug this into the CT's tool socket with the CT in auto mode,
+# and plug a 100-150 W incandescent/halogen bulb into this. Trigger pull -> relay
+# on -> bulb draws enough current -> CT starts.
+#
+# Pinout from athom-tech/esp32-configs athom-smart-plug.yaml:
+#   relay GPIO5, button GPIO3 (active low), blue LED GPIO6 (active low), CSE7766 RX GPIO20.
+#
+# Blue LED:  off = no tool seen
+#            on = WUT01 seen (tool powered, idle)
+#            fast flicker = trigger pulled
+#            slow blink = pairing mode    double blink = unpair mode
+#            rapid burst = a tool was just paired/unpaired
+#            while holding the button: slow blink (2 s, pair), double blink (5 s, unpair),
+#            fast flicker (10 s, forget all)
+
+substitutions:
+  name: athom-plug-makita-aws
+  friendly_name: Makita AWS plug
+  short_friendly_name: AWS plug
+  # Safety trip, amps. The plug is rated 15 A (US); a bulb load is ~1 A.
+  current_limit: "12"
+
+packages:
+  aws: !include aws-common.yaml
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-c3-devkitm-1
+  flash_size: 4MB
+  flash_mode: dio
+  variant: ESP32C3
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_BT_BLE_42_FEATURES_SUPPORTED: y
+      CONFIG_BT_BLE_50_FEATURES_SUPPORTED: y
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "10"
+
+logger:
+  # GPIO20 (UART0 RX) belongs to the CSE7766; keep the logger off the hardware UART.
+  baud_rate: 0
+  level: DEBUG
+  logs:
+    esp32_ble_tracker: INFO
+    light: INFO
+    binary_sensor: INFO
+    sensor: INFO
+    text_sensor: INFO
+    cse7766: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${short_friendly_name} fallback hotspot"
+    password: !secret wifi_ap_password
+
+captive_portal:
+
+uart:
+  id: uart_cse7766
+  rx_pin: GPIO20
+  baud_rate: 4800
+  data_bits: 8
+  stop_bits: 1
+  parity: EVEN
+
+binary_sensor:
+  - platform: status
+    name: Online
+
+  - platform: gpio
+    id: user_button
+    name: Button
+    entity_category: diagnostic
+    pin:
+      number: GPIO3
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on_off: 20ms
+    on_press:
+      - script.execute: aws_button_pressed
+    on_release:
+      - script.execute: aws_button_released
+
+switch:
+  - platform: gpio
+    id: extractor_relay
+    name: Extractor relay
+    pin: GPIO5
+    restore_mode: ALWAYS_OFF
+    icon: mdi:power-socket-us
+
+sensor:
+  # Watch these while switching the bulb by hand to find the CT15's real threshold.
+  - platform: cse7766
+    current:
+      name: Current
+      id: load_current
+      filters:
+        - throttle_average: 2s
+      on_value_range:
+        - above: ${current_limit}
+          then:
+            - switch.turn_off: extractor_relay
+    voltage:
+      name: Voltage
+      filters:
+        - throttle_average: 10s
+    power:
+      name: Power
+      filters:
+        - throttle_average: 2s
+    power_factor:
+      name: Power factor
+      entity_category: diagnostic
+      filters:
+        - throttle_average: 10s
+
+  - platform: uptime
+    name: Uptime
+    update_interval: 600s
+  - platform: internal_temperature
+    name: ESP temperature
+    update_interval: 600s
+
+button:
+  - platform: restart
+    name: ESP reboot
+    icon: mdi:power-cycle
+  - platform: safe_mode
+    name: Safe mode boot
+    entity_category: config
+
+text_sensor:
+  - platform: version
+    name: Version
+    hide_timestamp: true
+    entity_category: diagnostic
+  - platform: wifi_info
+    ip_address:
+      name: IP address
+
+output:
+  - platform: gpio
+    id: blue_led_out
+    pin:
+      number: GPIO6
+      inverted: true
+
+light:
+  - platform: binary
+    id: blue_led
+    name: Status LED
+    output: blue_led_out
+    restore_mode: ALWAYS_OFF
+    effects:
+      - strobe:
+          name: Flicker
+          colors:
+            - state: true
+              duration: 60ms
+            - state: false
+              duration: 60ms
+      - strobe:
+          name: Slow
+          colors:
+            - state: true
+              duration: 500ms
+            - state: false
+              duration: 500ms
+      - strobe:
+          name: Double
+          colors:
+            - state: true
+              duration: 120ms
+            - state: false
+              duration: 120ms
+            - state: true
+              duration: 120ms
+            - state: false
+              duration: 640ms
+      - strobe:
+          name: Burst
+          colors:
+            - state: true
+              duration: 30ms
+            - state: false
+              duration: 30ms
+
+# Render led_mode. Only touch the light when the mode changes, so effects can run.
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          using namespace makita_aws;
+          static int shown = -1;
+          const int want = id(led_mode);
+          if (want == shown) return;
+          shown = want;
+
+          auto *led = id(blue_led);
+          if (want == LED_OFF) {
+            led->turn_off().perform();
+            return;
+          }
+          auto call = led->turn_on();
+          switch (want) {
+            // While held, show the mode you'd enter on release.
+            case LED_TRIGGER: case LED_HOLD10: call.set_effect("Flicker"); break;
+            case LED_PAIR:    case LED_HOLD2:  call.set_effect("Slow"); break;
+            case LED_UNPAIR:  case LED_HOLD5:  call.set_effect("Double"); break;
+            case LED_BLINK:   call.set_effect("Burst"); break;
+            default:          call.set_effect("None"); break;  // PRESENT: solid
+          }
+          call.perform();

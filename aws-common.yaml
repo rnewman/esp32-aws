@@ -1,0 +1,311 @@
+# Shared Makita AWS (WUT01) receiver logic. Include as a package.
+#
+# The device config must provide:
+#   - a switch with id `extractor_relay`
+#   - a button binary_sensor that runs script `aws_button_pressed` on press and
+#     `aws_button_released` on release
+#   - something that renders global `led_mode` (a makita_aws::LedMode), updated every 100 ms
+#
+# Button: hold and release.
+#   >= 2 s  pairing mode (20 s): press the WUT01's AWS button to pair it
+#   >= 5 s  unpair mode (20 s): put the WUT01 in unpair mode to remove it
+#   >= 10 s forget all paired tools
+# While no tool is paired, any WUT01 in range is accepted.
+
+substitutions:
+  # Extractor keeps running this long after the trigger is released.
+  run_on: 3s
+
+esphome:
+  includes:
+    - makita_aws.h
+
+# Write pairings to flash promptly instead of after the default 1 min.
+preferences:
+  flash_write_interval: 5s
+
+esp32_ble_tracker:
+  scan_parameters:
+    # WUT01 sends ~10 adverts/s. Leave some radio time for WiFi.
+    interval: 100ms
+    window: 80ms
+    active: false
+  on_ble_advertise:
+    - then:
+        - lambda: |-
+            using namespace makita_aws;
+            const auto &r = x.get_scan_result();
+            uint8_t b[4];
+            const Msg m = parse(r.ble_adv, r.adv_data_len, b);
+            const uint64_t mac = x.address_uint64();
+            if (m == MSG_NONE) {
+              // Sniffing aid: a known tool sending something other than its usual
+              // advert (e.g. during pairing). Log each distinct payload once.
+              if (mac != 0 && mac == id(tool_mac)) {
+                static uint32_t last_hash = 0;
+                uint32_t h = 2166136261u;
+                const int n = r.adv_data_len + r.scan_rsp_len;
+                for (int i = 0; i < n; i++) h = (h ^ r.ble_adv[i]) * 16777619u;
+                if (h != last_hash) {
+                  last_hash = h;
+                  char hex[3 * 62 + 1] = {0};
+                  for (int i = 0; i < n && i < 62; i++) snprintf(hex + 3 * i, 4, "%02X ", r.ble_adv[i]);
+                  ESP_LOGW("aws", "Tool sent other advert (adv %u + rsp %u): %s",
+                           r.adv_data_len, r.scan_rsp_len, hex);
+                }
+              }
+              return;
+            }
+
+
+            const uint32_t now = millis();
+            auto &paired = id(paired_tools);
+            bool any_paired = false, is_paired = false;
+            for (auto p : paired) {
+              if (p) any_paired = true;
+              if (p && p == mac) is_paired = true;
+            }
+            char addr[18];
+            snprintf(addr, sizeof(addr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     r.bda[0], r.bda[1], r.bda[2], r.bda[3], r.bda[4], r.bda[5]);
+
+            if (m == MSG_UNKNOWN) {
+              // Anything shaped like a WUT01 advert can turn up here, so only report
+              // tools we already know about. These are new states worth recording.
+              if (is_paired || mac == id(tool_mac))
+                ESP_LOGW("aws", "%s unknown payload %02X %02X %02X %02X (addr type %u, rssi %d)",
+                         addr, b[0], b[1], b[2], b[3], r.ble_addr_type, r.rssi);
+              return;
+            }
+
+            if (m == MSG_PAIR && now < id(pair_until)) {
+              if (!is_paired) {
+                int slot = -1;
+                for (int i = 0; i < (int) paired.size(); i++) if (!paired[i]) { slot = i; break; }
+                if (slot < 0) {  // full: drop the oldest
+                  for (int i = 0; i + 1 < (int) paired.size(); i++) paired[i] = paired[i + 1];
+                  slot = paired.size() - 1;
+                }
+                paired[slot] = mac;
+                is_paired = any_paired = true;
+                ESP_LOGW("aws", "Paired %s in slot %d", addr, slot);
+              } else {
+                ESP_LOGW("aws", "%s was already paired", addr);
+              }
+              id(pair_until) = 0;
+              id(blink_until) = now + 1500;
+            } else if (m == MSG_UNPAIR && now < id(unpair_until)) {
+              for (auto &p : paired) if (p == mac) p = 0;
+              ESP_LOGW("aws", "Unpaired %s", addr);
+              id(unpair_until) = 0;
+              id(blink_until) = now + 1500;
+              return;
+            }
+
+            if (any_paired && !is_paired) {
+              ESP_LOGV("aws", "Ignoring unpaired %s (%s)", addr, msg_name(m));
+              return;
+            }
+
+            if (m != id(last_msg) || mac != id(tool_mac)) {
+              ESP_LOGI("aws", "%s %s [%02X %02X %02X %02X] addr type %u rssi %d",
+                       addr, msg_name(m), b[0], b[1], b[2], b[3], r.ble_addr_type, r.rssi);
+              id(tool_state).publish_state(msg_name(m));
+              id(tool_address).publish_state(addr);
+            }
+            id(adv_count)++;
+            id(last_payload) = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+            id(tool_mac) = mac;
+            id(last_msg) = m;
+            id(last_seen_ms) = now;
+            id(last_rssi) = r.rssi;
+            if (m == MSG_TRIGGER) {
+              id(trigger_mac) = mac;
+              id(last_trigger_ms) = now;
+            } else if (mac == id(trigger_mac)) {
+              id(last_trigger_ms) = 0;  // explicit release from the tool that was running
+            }
+
+globals:
+  # Up to four paired WUT01 MACs; 0 = empty slot.
+  - id: paired_tools
+    type: std::array<uint64_t, 4>
+    restore_value: true
+    initial_value: "std::array<uint64_t, 4>{}"
+  - id: tool_mac
+    type: uint64_t
+    initial_value: "0"
+  - id: trigger_mac
+    type: uint64_t
+    initial_value: "0"
+  - id: last_msg
+    type: uint8_t
+    initial_value: "0"
+  - id: last_seen_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: last_trigger_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: last_rssi
+    type: int
+    initial_value: "0"
+  - id: pair_until
+    type: uint32_t
+    initial_value: "0"
+  - id: unpair_until
+    type: uint32_t
+    initial_value: "0"
+  - id: blink_until
+    type: uint32_t
+    initial_value: "0"
+  - id: btn_down_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: led_mode
+    type: int
+    initial_value: "0"
+  # Sniffing aid: adverts accepted in the current second, and the latest payload.
+  # Logged once a second at VERBOSE; set `logger: logs: aws: VERBOSE` (and level VERBOSE) to see it.
+  - id: adv_count
+    type: int
+    initial_value: "0"
+  - id: last_payload
+    type: uint32_t
+    initial_value: "0"
+
+script:
+  - id: aws_pair_mode
+    then:
+      - lambda: |-
+          id(pair_until) = millis() + 20000;
+          id(unpair_until) = 0;
+          ESP_LOGW("aws", "Pairing mode for 20 s");
+  - id: aws_unpair_mode
+    then:
+      - lambda: |-
+          id(unpair_until) = millis() + 20000;
+          id(pair_until) = 0;
+          ESP_LOGW("aws", "Unpair mode for 20 s");
+  - id: aws_forget_all
+    then:
+      - lambda: |-
+          for (auto &p : id(paired_tools)) p = 0;
+          id(blink_until) = millis() + 1500;
+          ESP_LOGW("aws", "Forgot all paired tools");
+  - id: aws_button_pressed
+    then:
+      - lambda: id(btn_down_ms) = millis();
+  - id: aws_button_released
+    then:
+      - lambda: |-
+          const uint32_t held = millis() - id(btn_down_ms);
+          id(btn_down_ms) = 0;
+          if (held >= 10000) id(aws_forget_all).execute();
+          else if (held >= 5000) id(aws_unpair_mode).execute();
+          else if (held >= 2000) id(aws_pair_mode).execute();
+
+binary_sensor:
+  - platform: template
+    id: tool_present
+    name: Tool present
+    # Idle tools advertise continuously, so 3 s of silence means it was switched off or left range.
+    lambda: return id(last_seen_ms) != 0 && millis() - id(last_seen_ms) < 3000;
+    on_release:
+      - text_sensor.template.publish:
+          id: tool_state
+          state: absent
+
+  - platform: template
+    id: tool_trigger
+    name: Tool trigger
+    # Release normally arrives as an explicit "waiting" advert. The timeout covers
+    # a battery pulled mid-cut.
+    lambda: return id(last_trigger_ms) != 0 && millis() - id(last_trigger_ms) < 1000;
+
+  - platform: template
+    id: extractor_demand
+    name: Extractor demand
+    lambda: return id(tool_trigger).state;
+    filters:
+      - delayed_off: ${run_on}
+    on_press:
+      - switch.turn_on: extractor_relay
+    on_release:
+      - switch.turn_off: extractor_relay
+
+button:
+  - platform: template
+    name: Pair tool
+    on_press:
+      - script.execute: aws_pair_mode
+  - platform: template
+    name: Unpair tool
+    on_press:
+      - script.execute: aws_unpair_mode
+  - platform: template
+    name: Forget all tools
+    entity_category: config
+    on_press:
+      - script.execute: aws_forget_all
+
+sensor:
+  - platform: template
+    name: Paired tools
+    icon: mdi:link-variant
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      int n = 0;
+      for (auto p : id(paired_tools)) if (p) n++;
+      return n;
+  - platform: template
+    name: Tool RSSI
+    device_class: signal_strength
+    unit_of_measurement: dBm
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: |-
+      if (!id(tool_present).state) return NAN;
+      return id(last_rssi);
+
+text_sensor:
+  - platform: template
+    id: tool_state
+    name: Tool state
+    icon: mdi:saw-blade
+    update_interval: never
+  - platform: template
+    id: tool_address
+    name: Tool address
+    entity_category: diagnostic
+    update_interval: never
+
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          using namespace makita_aws;
+          const uint32_t now = millis();
+          const uint32_t held = id(btn_down_ms) ? now - id(btn_down_ms) : 0;
+          int want;
+          if (held >= 10000) want = LED_HOLD10;
+          else if (held >= 5000) want = LED_HOLD5;
+          else if (held >= 2000) want = LED_HOLD2;
+          else if (now < id(blink_until)) want = LED_BLINK;
+          else if (now < id(pair_until)) want = LED_PAIR;
+          else if (now < id(unpair_until)) want = LED_UNPAIR;
+          else if (id(tool_trigger).state) want = LED_TRIGGER;
+          else if (id(tool_present).state) want = LED_PRESENT;
+          else want = LED_OFF;
+          id(led_mode) = want;
+
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(adv_count) == 0) return;
+          const uint32_t p = id(last_payload);
+          ESP_LOGV("aws", "%2d adverts/s, last %s [%02X %02X %02X %02X] rssi %d", id(adv_count),
+                   makita_aws::msg_name(id(last_msg)), p >> 24, (p >> 16) & 0xFF, (p >> 8) & 0xFF,
+                   p & 0xFF, id(last_rssi));
+          id(adv_count) = 0;
