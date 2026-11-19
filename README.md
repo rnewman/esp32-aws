@@ -10,7 +10,7 @@ It runs on:
 |---|---|---|---|
 | [M5Stack NanoC6](https://docs.m5stack.com/en/core/M5NanoC6) | ESP32-C6 | A relay on the Grove port (your wiring) | Detection, pairing and LED tested with a track saw; relay not yet |
 | [Athom ESP32-C3 Plug (US)](https://www.athom.tech/blank-1/esp32-c3-us-plug-for-esphome) | ESP32-C3 | Its own mains relay, with power metering | Compiles, untested |
-| [Shelly Plug US Gen4](https://us.shelly.com/products/shelly-plug-us-gen4) | ESP32-C6 | Its own mains relay, with power metering | Compiles, untested |
+| [Shelly Plug US Gen4](https://us.shelly.com/products/shelly-plug-us-gen4) | ESP32-C6 | Its own mains relay, with power metering | Tested with a track saw and a 40 W load |
 
 Each device also reports to Home Assistant over the native API: tool present, trigger, tool state, RSSI, and the relay. Home Assistant isn't required, though. Pairing and relay switching all happen on the device.
 
@@ -116,6 +116,8 @@ The first flash needs a USB cable. After that, updates go over the air.
 
 - **Athom plug:** it ships with ESPHome already, so you can flash it over the air from its web UI or with `esphome run`. The CSE7766 power meter uses the serial pins, so this config turns off serial logging; read logs over WiFi instead.
 - **Shelly Plug US Gen4:** a plain ESPHome build won't boot on this plug. Convert the plug first with [automatous-io/shelly-gen4-esphome](https://github.com/automatous-io/shelly-gen4-esphome), following its INSTALL.md (through the stock web UI, no disassembly). Then flash this config over the air. The config pulls in that project's partition component so the plug keeps Shelly's flash layout.
+
+  What worked here: a new plug on stock 1.7.99 was running from slot 0. Installing the offered stock update (2.0.3) moved it to slot 1. The v1.5.2 conversion zip, uploaded through the stock web UI, then converted it. Once the converted firmware was on WiFi, `esphome upload shelly-plug-makita-aws.yaml --device <ip>` flashed this config. The web conversion can't back up the stock firmware, so if you want a way back, take a UART backup first.
 
 ### Files
 
