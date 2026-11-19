@@ -10,7 +10,7 @@ It runs on:
 |---|---|---|---|
 | [M5Stack NanoC6](https://docs.m5stack.com/en/core/M5NanoC6) | ESP32-C6 | A relay on the Grove port (your wiring) | Detection, pairing and LED tested with a track saw; relay not yet |
 | [Athom ESP32-C3 Plug (US)](https://www.athom.tech/blank-1/esp32-c3-us-plug-for-esphome) | ESP32-C3 | Its own mains relay, with power metering | Compiles, untested |
-| [Shelly Plug US Gen4](https://us.shelly.com/products/shelly-plug-us-gen4) | ESP32-C6 | Its own mains relay, with power metering | Tested with a track saw and a 40 W load |
+| [Shelly Plug US Gen4](https://us.shelly.com/products/shelly-plug-us-gen4) | ESP32-C6 | Its own mains relay, with power metering | Tested with a track saw, a 39 W halogen bulb and a CT15 |
 
 Each device also reports to Home Assistant over the native API: tool present, trigger, tool state, RSSI, and the relay. Home Assistant isn't required, though. Pairing and relay switching all happen on the device.
 
@@ -83,13 +83,13 @@ While you hold the button, the LED previews what releasing it will do.
 
 ### Festool CT15 and other auto-start extractors
 
-A CT in auto mode starts when the tool plugged into its socket draws enough current. The figures people quote for the minimum range from 0.4 A to 0.9 A. Not verified yet; the plug variants' power meters will measure it.
+A CT in auto mode starts when the tool plugged into its socket draws enough current. The figures people quote for the minimum range from 0.4 A to 0.9 A, but a US CT15 started on a 39 W halogen bulb, which the Shelly measured at 0.32 A (38.5 W at 122 V).
 
 1. Set the CT to auto and plug the Athom or Shelly plug into the CT's tool socket.
-2. Plug a 100–150 W incandescent or halogen bulb into the plug. That draws about 0.8–1.25 A at 120 V.
+2. Plug an incandescent or halogen bulb of about 40 W or more into the plug.
 3. On a trigger pull the relay lights the bulb, the CT sees the load and starts, and it runs on after the bulb goes off as it normally would.
 
-An LED bulb draws far too little to work. The plug draws a few hundred milliwatts on its own, which shouldn't be enough to start the CT, but this is untested.
+A typical LED bulb draws well under 0.1 A and probably won't work. The plug's own idle draw of a few hundred milliwatts doesn't start the CT.
 
 ### Extractors without auto-start
 

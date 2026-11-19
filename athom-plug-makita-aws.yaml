@@ -1,7 +1,7 @@
 # Makita AWS (WUT01) receiver on an Athom Plug V3 (ESP32-C3, US). See aws-common.yaml.
 #
 # For a Festool CT15: plug this into the CT's tool socket with the CT in auto mode,
-# and plug a 100-150 W incandescent/halogen bulb into this. Trigger pull -> relay
+# and plug a 40 W+ incandescent/halogen bulb into this (a 39 W halogen, 0.32 A, starts a US CT15). Trigger pull -> relay
 # on -> bulb draws enough current -> CT starts.
 #
 # Pinout from athom-tech/esp32-configs athom-smart-plug.yaml:
@@ -19,7 +19,7 @@ substitutions:
   name: athom-plug-makita-aws
   friendly_name: Makita AWS plug
   short_friendly_name: AWS plug
-  # Safety trip, amps. The plug is rated 15 A (US); a bulb load is ~1 A.
+  # Safety trip, amps. The plug is rated 15 A (US); a bulb load is well under 1 A.
   current_limit: "12"
 
 packages:
@@ -106,7 +106,7 @@ switch:
     icon: mdi:power-socket-us
 
 sensor:
-  # Watch these while switching the bulb by hand to find the CT15's real threshold.
+  # Shows what the bulb (and so the CT) sees.
   - platform: cse7766
     current:
       name: Current

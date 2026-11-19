@@ -1,7 +1,7 @@
 # Makita AWS (WUT01) receiver on a Shelly Plug US Gen4 (ESP32-C6, 8 MB). See aws-common.yaml.
 #
 # For a Festool CT15: plug this into the CT's tool socket with the CT in auto mode,
-# and plug a 100-150 W incandescent/halogen bulb into this. Trigger pull -> relay
+# and plug a 40 W+ incandescent/halogen bulb into this (a 39 W halogen, 0.32 A, starts a US CT15). Trigger pull -> relay
 # on -> bulb draws enough current -> CT starts.
 #
 # Hardware details from automatous-io/shelly-gen4-esphome (v1.5.2):
@@ -28,7 +28,7 @@ substitutions:
   name: shelly-plug-makita-aws
   friendly_name: Makita AWS Shelly
   short_friendly_name: AWS Shelly
-  # Safety trip, amps. The plug is rated 15 A; a bulb load is ~1 A.
+  # Safety trip, amps. The plug is rated 15 A; a bulb load is well under 1 A.
   current_limit: "12"
 
 packages:
@@ -132,7 +132,7 @@ uart:
   stop_bits: 1
 
 sensor:
-  # Watch these while switching the bulb by hand to find the CT15's real threshold.
+  # Shows what the bulb (and so the CT) sees.
   - platform: bl0942
     uart_id: uart_bl0942
     line_frequency: 60Hz
